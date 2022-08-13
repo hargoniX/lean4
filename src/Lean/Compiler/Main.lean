@@ -29,13 +29,22 @@ where
     let info ← getConstInfo declName
     Meta.isProp info.type <||> Meta.isTypeFormerType info.type
 
+/--
+A checkpoint in code generation to print all declarations in between
+compiler passes in order to ease debugging.
+The trace can be viewed with `set_option trace.Compiler.step true`.
+-/
 def checkpoint (step : Name) (decls : Array Decl) (cfg : Check.Config := {}): CoreM Unit := do
   trace[Compiler.step] "{step}"
   for decl in decls do
     withOptions (fun opts => opts.setBool `pp.motives.pi false) do
-      trace[Compiler.step] "{decl.name} := {decl.value}"
+      trace[Compiler.step] "{decl.name} : {decl.type} := {decl.value}"
       decl.check cfg
 
+/--
+Run the code generation pipeline for all declarations in `declNames`
+that fulfill the requirements of `shouldGenerateCode`.
+-/
 def compile (declNames : Array Name) : CoreM Unit := do profileitM Exception "compiler new" (← getOptions) do
   let declNames ← declNames.filterM shouldGenerateCode
   let decls ← declNames.mapM toDecl
