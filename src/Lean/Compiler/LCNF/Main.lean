@@ -12,6 +12,9 @@ import Lean.Compiler.LCNF.Check
 import Lean.Compiler.LCNF.PullLetDecls
 import Lean.Compiler.LCNF.PhaseExt
 import Lean.Compiler.LCNF.CSE
+import Lean.Compiler.LCNF.ToIR
+import Lean.Compiler.IR.Checker
+import Lean.Compiler.NoncomputableAttr
 
 namespace Lean.Compiler.LCNF
 /--
@@ -27,19 +30,28 @@ and `[specialize]` since they can be partially applied.
 def shouldGenerateCode (declName : Name) : CoreM Bool := do
   if (← isCompIrrelevant |>.run') then return false
   let some info ← getDeclInfo? declName | return false
-  unless info.hasValue do return false
+  unless (← hasCompilerValue info) do return false
   let env ← getEnv
-  if isExtern env declName then return false
   if hasMacroInlineAttribute env declName then return false
   if (← Meta.isMatcher declName) then return false
   if isCasesOnRecursor env declName then return false
   -- TODO: check if type class instance
   return true
 where
+  hasCompilerValue : ConstantInfo → CoreM Bool
+    | .defnInfo _ => return true
+    | .opaqueInfo _ => do
+      -- We have to compile some opaques because they can be used as values
+      let env ← getEnv
+      let isNotImplementedBy := getImplementedBy? env declName |>.isNone
+      let isNotInit := getInitFnNameFor? env declName |>.isNone
+      return isNotImplementedBy && isNotInit
+    | _ => return false
   isCompIrrelevant : MetaM Bool := do
     let info ← getConstInfo declName
+    -- TODO: check whether we need this
+    if isNoncomputable (← getEnv) declName then return true
     Meta.isProp info.type <||> Meta.isTypeFormerType info.type
-
 /--
 A checkpoint in code generation to print all declarations in between
 compiler passes in order to ease debugging.
@@ -59,13 +71,14 @@ def checkpoint (stepName : Name) (decls : Array Decl) : CompilerM Unit := do
 
 namespace PassManager
 
-def run (declNames : Array Name) : CompilerM (Array Decl) := withAtLeastMaxRecDepth 8192 do
+def run (declNames : Array Name) : CompilerM (Array IR.Decl) := withAtLeastMaxRecDepth 8192 do
   /-
   Note: we need to increase the recursion depth because we currently do to save phase1
   declarations in .olean files. Then, we have to recursively compile all dependencies,
   and it often creates a very deep recursion.
   Moreover, some declarations get very big during simplification.
   -/
+  let (declNames, externDeclNames) ← partition declNames
   let declNames ← declNames.filterM (shouldGenerateCode ·)
   if declNames.isEmpty then return #[]
   let mut decls ← declNames.mapM toDecl
@@ -80,11 +93,27 @@ def run (declNames : Array Name) : CompilerM (Array Decl) := withAtLeastMaxRecDe
       -- We display the declaration saved in the environment because the names have been normalized
       let some decl' ← getDeclAt? decl.name .mono | unreachable!
       Lean.addTrace `Compiler.result m!"size: {decl.size}\n{← ppDecl' decl'}"
-  return decls
+  let irDecls ← withPhase .mono do
+    let irDecls ← Decl.toIRDecls decls
+    irDecls.forM (IO.println <| format ·)
+    --let (log, _) := IR.compile (← getEnv) {} irDecls
+    pure irDecls
+  let externIRDecls ← Decl.externToIRDecls externDeclNames
+  --if (← Lean.isTracingEnabledFor `Compiler.result) then
+  --  Lean.addTrace `Compiler.result log.toString
+  return externIRDecls ++ irDecls
+where
+  partition (declNames : Array Name) : CompilerM (Array Name × Array Name) := do
+    let splitter := fun (decls, externs) decl => do
+      if isExtern (← getEnv) decl then
+        return (decls, externs.push decl)
+      else
+        return (decls.push decl, externs)
+    declNames.foldlM (init := (#[], #[])) splitter
 
 end PassManager
 
-def compile (declNames : Array Name) : CoreM (Array Decl) :=
+def compile (declNames : Array Name) : CoreM (Array IR.Decl) :=
   CompilerM.run <| PassManager.run declNames
 
 def showDecl (phase : Phase) (declName : Name) : CoreM Format := do

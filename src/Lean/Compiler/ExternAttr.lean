@@ -138,7 +138,7 @@ def getExternNameFor (env : Environment) (backend : Name) (fn : Name) : Option S
   | ExternEntry.foreign _ n  => pure n
   | _ => failure
 
-private def getExternConstArity (declName : Name) : CoreM Nat := do
+def getExternConstArity (declName : Name) : CoreM Nat := do
   let fromSignature : Unit → CoreM Nat := fun _ => do
     let cinfo ← getConstInfo declName
     let (arity, _) ← (Meta.forallTelescopeReducing cinfo.type fun xs _ => pure xs.size : MetaM Nat).run

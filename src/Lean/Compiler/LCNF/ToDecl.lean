@@ -95,7 +95,7 @@ The steps for this are roughly:
 def toDecl (declName : Name) : CompilerM Decl := do
   let declName := if let some name := isUnsafeRecName? declName then name else declName
   let some info ← getDeclInfo? declName | throwError "declaration `{declName}` not found"
-  let some value := info.value? | throwError "declaration `{declName}` does not have a value"
+  let some value := compilerValue? info | throwError "declaration `{declName}` does not have a value"
   let (type, value) ← Meta.MetaM.run' do
     let type  ← toLCNFType info.type
     let value ← Meta.lambdaTelescope value fun xs body => do Meta.mkLambdaFVars xs (← Meta.etaExpand body)
@@ -121,5 +121,11 @@ def toDecl (declName : Name) : CompilerM Decl := do
     pure { name := declName, params := #[], type, value, levelParams := info.levelParams, safe, inlineAttr? }
   /- `toLCNF` may eta-reduce simple declarations. -/
   decl.etaExpand
+where
+  compilerValue? : ConstantInfo → Option Expr
+    | .defnInfo {value := r, ..}    => some r
+    | .thmInfo  {value := r, ..}    => some r
+    | .opaqueInfo  {value := r, ..} => some r
+    | _                             => none
 
 end Lean.Compiler.LCNF
