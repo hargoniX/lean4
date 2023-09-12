@@ -96,11 +96,14 @@ def run (declNames : Array Name) : CompilerM (Array IR.Decl) := withAtLeastMaxRe
   let irDecls ← withPhase .mono do
     let irDecls ← Decl.toIRDecls decls
     irDecls.forM (IO.println <| format ·)
-    --let (log, _) := IR.compile (← getEnv) {} irDecls
     pure irDecls
   let externIRDecls ← Decl.externToIRDecls externDeclNames
-  --if (← Lean.isTracingEnabledFor `Compiler.result) then
-  --  Lean.addTrace `Compiler.result log.toString
+  let allDecls := externIRDecls ++ irDecls
+  -- TODO: we probably want to run this at the entry point to the compiler and not here.
+  -- just like it currently happens with the actual IR compiler, but for now this is fine
+  let (log, _) := IR.compile (← getEnv) {} allDecls
+  if (← Lean.isTracingEnabledFor `Compiler.result) then
+    Lean.addTrace `Compiler.result log.toString
   return externIRDecls ++ irDecls
 where
   partition (declNames : Array Name) : CompilerM (Array Name × Array Name) := do

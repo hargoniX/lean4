@@ -1,6 +1,7 @@
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.IR
 import Lean.Compiler.LCNF.PhaseExt
+import Lean.Compiler.LCNF.ToDecl
 
 namespace Lean.Compiler.LCNF
 
@@ -275,12 +276,21 @@ where
     -/
     return .fdecl decl.name params type body {}
 
-def Decl.externToIRDecls (externs : Array Decl) : CompilerM (Array IR.Decl) :=
+def Decl.externToIRDecls (externs : Array Name) : CompilerM (Array IR.Decl) :=
   externs.mapM go |>.run' {}
 where
-  go (decl : Decl) : IrM IR.Decl := do
-    let params ← decl.params.mapM Param.toIRParam
-    let type ← decl.type.toIRType
-    return .extern decl.name params type (getExternAttrData? (← getEnv) decl.name).get!
+  go (declName : Name) : IrM IR.Decl := do
+    let some info ← getDeclInfo? declName | throwError "declaration `{declName}` not found"
+    let baseType ← toLCNFType info.type |>.run'
+    let monoType ← toMonoType baseType
+    -- TODO: Do we have a function for this?
+    let (args, retTy) ← Meta.MetaM.run' <| Meta.forallTelescope monoType (fun args ty => do return (args, ty))
+    let params ← args.mapM fun argTy => do return {
+      x := ⟨← getId⟩
+      -- TODO: not all borrows are false
+      borrow := false
+      ty := (← argTy.toIRType)
+    }
+    return .extern declName params (← retTy.toIRType) (getExternAttrData? (← getEnv) declName).get!
 
 end Lean.Compiler.LCNF
