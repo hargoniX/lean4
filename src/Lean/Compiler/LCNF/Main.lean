@@ -95,6 +95,7 @@ def run (declNames : Array Name) : CompilerM (Array IR.Decl) := withAtLeastMaxRe
       Lean.addTrace `Compiler.result m!"size: {decl.size}\n{← ppDecl' decl'}"
   let irDecls ← withPhase .mono do
     let irDecls ← Decl.toIRDecls decls
+    IO.println  "****** IR for this block:"
     irDecls.forM (IO.println <| format ·)
     pure irDecls
   let externIRDecls ← Decl.externToIRDecls externDeclNames

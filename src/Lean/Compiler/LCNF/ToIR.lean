@@ -101,10 +101,15 @@ have to insert an erased declaration explicitly at the target location. -/
 deriving Inhabited
 
 structure State where
-  counter : Nat := 0
+  /-
+  IR feels like a Lua
+  -/
+  counter : Nat := 1
   fvarMap : FVarIdMap FVarTranslation := {}
 
 abbrev IrM := StateRefT State CompilerM
+
+def IrM.run (x : IrM α) : CompilerM α := x.run' {}
 
 def getId : IrM Nat := do
   let currId := (← get).counter
@@ -170,7 +175,9 @@ def translateLetValue! (value : LetValue) : IrM (Option IR.Expr) := do
       | some (.ctorInfo info) =>
         let args := args[info.numParams:].toArray
         if info.numFields == args.size then
-          return some <| .ctor (← IR.CtorInfo.ofCtorName declName) translatedArgs
+          -- ctors do not take irrelevant arguments since inductives dont have irrelevant fields
+          let filteredTranslatedArgs := translatedArgs.filter (· != .irrelevant)
+          return some <| .ctor (← IR.CtorInfo.ofCtorName declName) filteredTranslatedArgs
         else
           throwError "Tried to translate a pap ctor, this is a bug"
       | some (.opaqueInfo _) | some (.defnInfo _) => externApplication declName translatedArgs
@@ -264,33 +271,35 @@ They are not available here anymore, we have to generate the info at
 the compiler frontend.
 -/
 def Decl.toIRDecls (decls : Array Decl) : CompilerM (Array IR.Decl) := do
-  decls.mapM go |>.run' {}
+  decls.mapM go
 where
-  go (decl : Decl) : IrM IR.Decl := do
-    let params ← decl.params.mapM Param.toIRParam
-    let type ← decl.type.toIRType
-    let body ← decl.value.toFnBody
-    /- TODO: sorryDep? is already implemented for IR.Decl but needs
-      to run in the IR.CompilerM monad, once we switched into that one
-      we will first run updateSorryDep on them.
-    -/
-    return .fdecl decl.name params type body {}
+  go (decl : Decl) : CompilerM IR.Decl :=
+    IrM.run do
+       let params ← decl.params.mapM Param.toIRParam
+       let type ← decl.type.toIRType
+       let body ← decl.value.toFnBody
+       /- TODO: sorryDep? is already implemented for IR.Decl but needs
+         to run in the IR.CompilerM monad, once we switched into that one
+         we will first run updateSorryDep on them.
+       -/
+       return .fdecl decl.name params type body {}
 
 def Decl.externToIRDecls (externs : Array Name) : CompilerM (Array IR.Decl) :=
-  externs.mapM go |>.run' {}
+  externs.mapM go
 where
-  go (declName : Name) : IrM IR.Decl := do
-    let some info ← getDeclInfo? declName | throwError "declaration `{declName}` not found"
-    let baseType ← toLCNFType info.type |>.run'
-    let monoType ← toMonoType baseType
-    -- TODO: Do we have a function for this?
-    let (args, retTy) ← Meta.MetaM.run' <| Meta.forallTelescope monoType (fun args ty => do return (args, ty))
-    let params ← args.mapM fun argTy => do return {
-      x := ⟨← getId⟩
-      -- TODO: not all borrows are false
-      borrow := false
-      ty := (← argTy.toIRType)
-    }
-    return .extern declName params (← retTy.toIRType) (getExternAttrData? (← getEnv) declName).get!
+  go (declName : Name) : CompilerM IR.Decl :=
+    IrM.run do
+      let some info ← getDeclInfo? declName | throwError "declaration `{declName}` not found"
+      let baseType ← toLCNFType info.type |>.run'
+      let monoType ← toMonoType baseType
+      -- TODO: Do we have a function for this?
+      let (args, retTy) ← Meta.MetaM.run' <| Meta.forallTelescope monoType (fun args ty => do return (args, ty))
+      let params ← args.mapM fun argTy => do return {
+        x := ⟨← getId⟩
+        -- TODO: not all borrows are false
+        borrow := false
+        ty := (← argTy.toIRType)
+      }
+      return .extern declName params (← retTy.toIRType) (getExternAttrData? (← getEnv) declName).get!
 
 end Lean.Compiler.LCNF
