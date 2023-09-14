@@ -312,24 +312,26 @@ def compileDecl (decl : Declaration) : CoreM Unit := do
   let opts ← getOptions
   if compiler.enableNew.get opts then
     compileDeclsNew (Compiler.getDeclNamesForCodeGen decl)
-  match (← getEnv).compileDecl opts decl with
-  | Except.ok env   => setEnv env
-  | Except.error (KernelException.other msg) =>
-    checkUnsupported decl -- Generate nicer error message for unsupported recursors and axioms
-    throwError msg
-  | Except.error ex =>
-    throwKernelException ex
+  else
+    match (← getEnv).compileDecl opts decl with
+    | Except.ok env   => setEnv env
+    | Except.error (KernelException.other msg) =>
+      checkUnsupported decl -- Generate nicer error message for unsupported recursors and axioms
+      throwError msg
+    | Except.error ex =>
+      throwKernelException ex
 
 def compileDecls (decls : List Name) : CoreM Unit := do
   let opts ← getOptions
   if compiler.enableNew.get opts then
     compileDeclsNew decls
-  match (← getEnv).compileDecls opts decls with
-  | Except.ok env   => setEnv env
-  | Except.error (KernelException.other msg) =>
-    throwError msg
-  | Except.error ex =>
-    throwKernelException ex
+  else
+    match (← getEnv).compileDecls opts decls with
+    | Except.ok env   => setEnv env
+    | Except.error (KernelException.other msg) =>
+      throwError msg
+    | Except.error ex =>
+      throwKernelException ex
 
 def addAndCompile (decl : Declaration) : CoreM Unit := do
   addDecl decl;

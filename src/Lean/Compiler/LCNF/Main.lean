@@ -80,7 +80,7 @@ def run (declNames : Array Name) : CompilerM (Array IR.Decl) := withAtLeastMaxRe
   -/
   let (declNames, externDeclNames) ← partition declNames
   let declNames ← declNames.filterM (shouldGenerateCode ·)
-  if declNames.isEmpty then return #[]
+  if declNames.isEmpty && externDeclNames.isEmpty then return #[]
   let mut decls ← declNames.mapM toDecl
   decls := markRecDecls decls
   let manager ← getPassManager
@@ -94,18 +94,18 @@ def run (declNames : Array Name) : CompilerM (Array IR.Decl) := withAtLeastMaxRe
       let some decl' ← getDeclAt? decl.name .mono | unreachable!
       Lean.addTrace `Compiler.result m!"size: {decl.size}\n{← ppDecl' decl'}"
   let irDecls ← withPhase .mono do
-    let irDecls ← Decl.toIRDecls decls
-    IO.println  "****** IR for this block:"
-    irDecls.forM (IO.println <| format ·)
-    pure irDecls
+    Decl.toIRDecls decls
   let externIRDecls ← Decl.externToIRDecls externDeclNames
+  externIRDecls.forM fun decl => do
+    let mut env ← getEnv
+    env := IR.addDeclAux env decl
+    env ←
+      match IR.addBoxedVersion env decl with
+      | .ok env' => pure env'
+      | .error err => throwError err
+    setEnv env
   let allDecls := externIRDecls ++ irDecls
-  -- TODO: we probably want to run this at the entry point to the compiler and not here.
-  -- just like it currently happens with the actual IR compiler, but for now this is fine
-  let (log, _) := IR.compile (← getEnv) {} allDecls
-  if (← Lean.isTracingEnabledFor `Compiler.result) then
-    Lean.addTrace `Compiler.result log.toString
-  return externIRDecls ++ irDecls
+  return allDecls
 where
   partition (declNames : Array Name) : CompilerM (Array Name × Array Name) := do
     let splitter := fun (decls, externs) decl => do
@@ -128,7 +128,15 @@ def showDecl (phase : Phase) (declName : Name) : CoreM Format := do
 def main (declNames : List Name) : CoreM Unit := do
   profileitM Exception "compilation new" (← getOptions) do
     withTraceNode `Compiler (fun _ => return m!"compiling new: {declNames}") do
-      CompilerM.run <| discard <| PassManager.run declNames.toArray
+      let decls ← CompilerM.run <| PassManager.run declNames.toArray
+      IO.println s!"****Decls for this block:"
+      decls.forM (IO.println <| format ·)
+      let (log, env?) := IR.compile (← getEnv) (← getOptions) decls
+      if (← Lean.isTracingEnabledFor `Compiler.result) then
+        Lean.addTrace `Compiler.result log.toString
+      match env? with
+      | Except.ok env => setEnv env
+      | Except.error msg => throwError msg
 
 builtin_initialize
   registerTraceClass `Compiler.init (inherited := true)
