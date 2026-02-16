@@ -8,6 +8,7 @@ module
 prelude
 public import Lean.Compiler.LCNF.CompilerM
 public import Lean.Compiler.LCNF.PassManager
+import Lean.Compiler.LCNF.PhaseExt
 
 namespace Lean.Compiler.LCNF
 
@@ -131,6 +132,12 @@ def LiveVars.merge (liveVars1 liveVars2 : LiveVars) : LiveVars :=
   let borrows := liveVars1.borrows.merge liveVars2.borrows
   { vars, borrows }
 
+@[inline]
+def LiveVars.erase (liveVars : LiveVars) (fvarId : FVarId) : LiveVars :=
+  let vars := liveVars.vars.erase fvarId
+  let borrows := liveVars.borrows.erase fvarId
+  { vars, borrows }
+
 abbrev JPLiveVarMap := FVarIdMap LiveVars
 
 structure Context where
@@ -149,6 +156,12 @@ def getVarInfo (fvarId : FVarId) : RcM VarInfo := return (← read).varMap.get! 
 
 @[inline]
 def getJpLiveVars (fvarId : FVarId) : RcM LiveVars := return (← read).jpLiveVarMap.get! fvarId
+
+@[inline]
+def isLive (fvarId : FVarId) : RcM Bool := return (← get).liveVars.vars.contains fvarId
+
+@[inline]
+def isBorrowed (fvarId : FVarId) : RcM Bool := return (← get).liveVars.borrows.contains fvarId
 
 @[inline]
 def withParams (ps : Array (Param .impure)) (x : RcM α) : RcM α := do
@@ -181,6 +194,20 @@ def withLetDecl (decl : LetDecl .impure) (x : RcM α) : RcM α := do
   withReader (fun ctx => { ctx with varMap := ctx.varMap.insert decl.fvarId varInfo}) do
     x
 
+@[inline]
+def withCtorAlt (discr : FVarId) (c : CtorInfo) (x : RcM α) : RcM α := do
+  withReader
+    (fun ctx =>
+      { ctx with
+        varMap :=
+          match ctx.varMap.get? discr with
+          | some info =>
+            let isPossibleRef := c.type.isPossibleRef
+            let isDefiniteRef := c.type.isDefiniteRef
+            ctx.varMap.insert discr { info with isPossibleRef, isDefiniteRef }
+          | none => ctx.varMap
+      }) do x
+
 def withLiveVars (liveVars : LiveVars) (x : RcM α) : RcM α := do
   let currentLiveVars := (← get).liveVars
   modify fun s => { s with liveVars }
@@ -189,27 +216,169 @@ def withLiveVars (liveVars : LiveVars) (x : RcM α) : RcM α := do
   finally
     modify fun s => { s with liveVars := currentLiveVars }
 
-@[specialize]
-def useVar (fvarId : FVarId) (shouldBorrow : FVarId → Bool := fun _ => true) : RcM Unit := sorry
+@[inline]
+def withCollectLiveVars (x : RcM α) : RcM (α × LiveVars) := do
+  withLiveVars {} do
+    let ret ← x
+    return (ret, (← get).liveVars)
 
-def useArgs (args : Array (Arg .impure)) : RcM Unit := sorry
+@[specialize]
+partial def addDescendants (fvarId : FVarId) (shouldAdd : FVarId → Bool := fun _ => true) :
+    RcM Unit := sorry
+
+@[specialize]
+def useVar (fvarId : FVarId) (shouldBorrow : FVarId → Bool := fun _ => true) : RcM Unit := do
+  if !(← isLive fvarId) then
+    let liveVars := (← get).liveVars
+    addDescendants fvarId fun y =>
+      !liveVars.vars.contains y && shouldBorrow y
+  modify fun s => { s with liveVars := { s.liveVars with vars := s.liveVars.vars.insert fvarId }}
+
+@[inline]
+def useArg (args : Array (Arg .impure)) (arg : Arg .impure) : RcM Unit :=
+  match arg with
+  | .fvar fvarId =>
+    useVar fvarId fun y =>
+      args.all fun arg =>
+        match arg with
+        | .fvar z => y != z
+        | .erased => true
+  | .erased => return ()
+
+def useArgs (args : Array (Arg .impure)) : RcM Unit := do
+  args.forM (useArg args)
+
+def useLetValue (value : LetValue .impure) : RcM Unit := do
+  match value with
+  | .oproj (var := fvarId) .. | .uproj (var := fvarId) .. | .sproj (var := fvarId) ..
+  | .box (fvarId := fvarId) .. | .unbox (fvarId := fvarId) .. | .reset (var := fvarId) .. =>
+    useVar fvarId
+  | .ctor (args := args) .. | .fap (args := args) .. | .pap (args := args) .. =>
+    useArgs args
+  | .fvar fvarId args .. | .reuse (var := fvarId) (args := args) .. =>
+    useVar fvarId
+    useArgs args
+  | .lit .. | .erased => return ()
+
+@[inline]
+def bindVar (fvarId : FVarId) : RcM Unit :=
+  modify fun s => { s with liveVars := s.liveVars.erase fvarId }
 
 def setRetLiveVars : RcM Unit := sorry
 
-def addDecForDeadParams (ps : Array (Param .impure)) (code : Code .impure) : RcM (Code .impure) :=
-  sorry
+@[inline]
+def addInc (fvarId : FVarId) (k : Code .impure) (n : Nat := 1) : RcM (Code .impure) := do
+  let info ← getVarInfo fvarId
+  if n == 0 then
+    return k
+  else
+    sorry
 
 @[inline]
-def addInc (fvarId : FVarId) (k : Code .impure) (n : Nat := 1) : RcM (Code .impure) :=
+def addDec (fvarId : FVarId) (k : Code .impure) : RcM (Code .impure) := do
+  let info ← getVarInfo fvarId
+  sorry
+
+def addDecForAlt (altLiveVars : LiveVars) (k : Code .impure) : RcM (Code .impure) := do
+  (← get).liveVars.vars.foldlM (init := k) fun k fvarId => do
+    let info ← getVarInfo fvarId
+    if !altLiveVars.vars.contains fvarId then
+      if info.isPossibleRef && !(← isBorrowed fvarId) then
+        addDec fvarId k
+      else
+        return k
+    else if (← isBorrowed fvarId) && !altLiveVars.borrows.contains fvarId then
+      addInc fvarId k
+    else
+      return k
+
+def addIncBeforeConsumeAll (allArgs : Array (Arg .impure)) (k : Code .impure) :
+    RcM (Code .impure) := do
   sorry
 
 def addIncBefore (args : Array (Arg .impure)) (ps : Array (Param .impure)) (k : Code .impure) :
     RcM (Code .impure) := do
   sorry
 
+def addDecAfterFullApp (args : Array (Arg .impure)) (ps : Array (Param .impure)) (k : Code .impure) :
+    RcM (Code .impure) := do
+  let mut k := k
+  for h : i in 0...args.size do
+    match args[i] with
+    | .erased => pure ()
+    | .fvar fvarId =>
+      /-
+      We must add a `dec` if `fvarId` must be consumed, it is alive after the application,
+      and it has been borrowed by the application.
+      Remark: `fvarId` may occur multiple times in the application (e.g., `f fvarId y fvarId`).
+      This is why we check whether it is the first occurrence.
+      -/
+      let info ← getVarInfo fvarId
+      if info.isPossibleRef && isFirstOcc args i && isBorrowParam arg args ps && !(← isLive fvarId) && (← isBorrowed fvarId) then
+        k ← addDec fvarId k
+  return k
+
+/--
+Add `dec` for `fvarId` if `fvarId` is a reference, not alive in `k` and not borrowed.
+-/
+def addDecIfNeeded (fvarId : FVarId) (k : Code .impure) : RcM (Code .impure) := do
+  let info ← getVarInfo fvarId
+  if info.isPossibleRef && !(← isBorrowed fvarId) && !(← isLive fvarId) then
+    addDec fvarId k
+  else
+    return k
+
+/--
+Add `dec` instructions for parameters that are references, are not alive in `k`, and are not borrow.
+That is, we must make sure these parameters are consumed.
+-/
+def addDecForDeadParams (ps : Array (Param .impure)) (k : Code .impure) : RcM (Code .impure) :=
+  ps.foldlM (init := k) fun k p => do
+    let k ← addDecIfNeeded p.fvarId k
+    bindVar p.fvarId
+    return k
+
 def LetDecl.explicitRc (code : Code .impure) (decl : LetDecl .impure) (k : Code .impure) :
     RcM (Code .impure) := do
-  sorry
+  /-
+  `decl.fvarId` can be unused in `k` so we might have to drop it. Note that we do not remove the let
+  because we are in the impure phase of the compiler so `decl.value` can have side effects that we
+  don't want to loose.
+  -/
+  let k ← addDecIfNeeded decl.fvarId k
+  let k ←
+    match decl.value with
+    | .ctor (args := args) .. | .reuse (args := args) .. | .pap (args := args) .. =>
+      addIncBeforeConsumeAll args (code.updateLet! decl k)
+    | .oproj (var := fvarId) .. =>
+      let k ← addDecIfNeeded fvarId k
+      let k ← if ← isBorrowed decl.fvarId then pure k else addInc decl.fvarId k
+      return code.updateLet! decl k
+    | .uproj (var := fvarId) .. | .sproj (var := fvarId) .. | .unbox (fvarId := fvarId) .. =>
+      let k ← addDecIfNeeded fvarId k
+      pure <| code.updateLet! decl k
+    | .fap f args =>
+      let ps := (← getImpureSignature? f).get!.params
+      let k ← addDecAfterFullApp args ps k
+      let liveVars := (← get).liveVars
+      let value ←
+        if f == ``Array.getInternal && (← isBorrowed decl.fvarId) then
+          pure <| .fap ``Array.getInternalBorrowed args
+        else if f == ``Array.get!Internal && (← isBorrowed decl.fvarId) then
+          pure <| .fap ``Array.get!InternalBorrowed args
+        else
+          pure <| decl.value
+      let decl ← decl.updateValue value
+      let k := code.updateLet! decl k
+      addIncBefore args ps k
+    | .fvar fvarId args =>
+      let allArgs := args.push <| .fvar fvarId
+      addIncBeforeConsumeAll allArgs (code.updateLet! decl k)
+    | .lit .. | .box .. | .reset .. | .erased .. =>
+      pure <| code.updateLet! decl k
+  useLetValue decl.value
+  bindVar decl.fvarId
+  return k
 
 partial def Code.explicitRc (code : Code .impure) : RcM (Code .impure) := do
   match code with
@@ -220,22 +389,38 @@ partial def Code.explicitRc (code : Code .impure) : RcM (Code .impure) := do
   | .jp decl k =>
     let (decl, jpLive) ←
       withParams decl.params do
-      withLiveVars {} do
+      withCollectLiveVars do
         let value ← decl.value.explicitRc
         let value ← addDecForDeadParams decl.params value
-        let decl ← decl.updateValue value
-        return (decl, (← get).liveVars)
+        decl.updateValue value
     withReader (fun ctx => { ctx with jpLiveVarMap := ctx.jpLiveVarMap.insert decl.fvarId jpLive }) do
       let k ← k.explicitRc
       return code.updateFun! decl k
   | .cases cs =>
-    let alts : Array (Alt .impure × LiveVars) ← cs.alts.mapM fun alt =>
-      sorry
-    let caseLiveVars : LiveVars := alts.foldl (init := {}) fun acc ⟨_, altLive⟩ => acc.merge altLive
-    let alts : Array (Alt .impure) ← alts.mapM fun ⟨alt, altLiveVars⟩ =>
-      sorry
-    sorry
-    return code.updateAlts! alts
+    let alts ← cs.alts.mapM fun alt =>
+      match alt with
+      | .ctorAlt c k =>
+        withCtorAlt cs.discr c do
+        withCollectLiveVars do
+          let k ← k.explicitRc
+          return alt.updateCode k
+      | .default k =>
+        withCollectLiveVars do
+          let k ← k.explicitRc
+          return alt.updateCode k
+    let caseLiveVars := alts.foldl (init := {}) fun acc ⟨_, altLive⟩ => acc.merge altLive
+    withLiveVars caseLiveVars do
+      useVar cs.discr
+      let alts ← alts.mapM fun ⟨alt, altLiveVars⟩ => do
+        match alt with
+        | .ctorAlt c k =>
+          withCtorAlt cs.discr c do
+            let k ← addDecForAlt altLiveVars k
+            return alt.updateCode k
+        | .default k =>
+          let k ← addDecForAlt altLiveVars k
+          return alt.updateCode k
+      return code.updateAlts! alts
   | .jmp fvarId args =>
     let jpLiveVars ← getJpLiveVars fvarId
     let ps := (← findFunDecl? fvarId).get!.params
@@ -247,7 +432,7 @@ partial def Code.explicitRc (code : Code .impure) : RcM (Code .impure) := do
     setRetLiveVars
     let info ← getVarInfo fvarId
     useVar fvarId
-    if info.isPossibleRef && (← get).liveVars.borrows.contains fvarId then
+    if info.isPossibleRef && (← isBorrowed fvarId) then
       addInc fvarId code
     else
       return code
