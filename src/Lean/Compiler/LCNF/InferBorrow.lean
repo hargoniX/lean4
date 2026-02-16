@@ -95,14 +95,17 @@ where
 /--
 Apply the inferred borrow annotations from `map` to a SCC.
 -/
-partial def apply (decls : Array (Decl .impure)) (map : ParamMap) : CompilerM (Array (Decl .impure)) :=
-  decls.mapM fun decl => do
+partial def apply (decls : Array (Decl .impure)) (map : ParamMap) :
+    CompilerM (Array (Decl .impure)) := do
+  let decls ← decls.mapM fun decl => do
     match decl.value with
     | .code code =>
       let code ← go decl.name code
       let newParams ← updateParams decl.params map[ParamMap.Key.decl decl.name]!
       return { decl with value := .code code, params := newParams }
     | _ => return decl
+  decls.forM (·.saveImpure)
+  return decls
 where
   updateParams (ps : Array (Param .impure)) (borrows : Array (Param .impure)) :
       CompilerM (Array (Param .impure)) := do
