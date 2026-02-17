@@ -9,6 +9,7 @@ prelude
 public import Lean.Compiler.LCNF.CompilerM
 public import Lean.Compiler.LCNF.PassManager
 import Lean.Compiler.LCNF.PhaseExt
+import Lean.Runtime
 
 namespace Lean.Compiler.LCNF
 
@@ -181,7 +182,18 @@ def LetValue.isPersistent (val : LetValue .impure) : Bool :=
   | _ => false
 
 -- TODO: This heuristic should never be necessary
-def refineTypeForExpr (value : LetValue .impure) (origt : Expr) : Expr := sorry
+def refineTypeForExpr (value : LetValue .impure) (origt : Expr) : Expr :=
+  if origt.isScalar then
+    origt
+  else
+    match value with
+    | .ctor c _ => c.type
+    | .lit (.nat n) =>
+      if n ≤ maxSmallNat then
+        tagged
+      else
+        origt
+    | _ => origt
 
 @[inline]
 def withLetDecl (decl : LetDecl .impure) (x : RcM α) : RcM α := do
@@ -223,15 +235,22 @@ def withCollectLiveVars (x : RcM α) : RcM (α × LiveVars) := do
     return (ret, (← get).liveVars)
 
 @[specialize]
-partial def addDescendants (fvarId : FVarId) (shouldAdd : FVarId → Bool := fun _ => true) :
-    RcM Unit := sorry
+partial def addDescendants (fvarId : FVarId) (s : FVarIdSet)
+    (shouldAdd : FVarId → Bool := fun _ => true) : RcM FVarIdSet := do
+  if let some info := (← read).derivedValMap.get? fvarId then
+    info.children.foldM (init := s) fun s child =>
+      let s := if shouldAdd child then s.insert child else s
+      addDescendants child s shouldAdd
+  else
+    return s
 
 @[specialize]
 def useVar (fvarId : FVarId) (shouldBorrow : FVarId → Bool := fun _ => true) : RcM Unit := do
   if !(← isLive fvarId) then
     let liveVars := (← get).liveVars
-    addDescendants fvarId fun y =>
+    let borrows ← addDescendants fvarId liveVars.borrows fun y =>
       !liveVars.vars.contains y && shouldBorrow y
+    modify fun s => { s with liveVars := { s.liveVars with borrows := borrows }}
   modify fun s => { s with liveVars := { s.liveVars with vars := s.liveVars.vars.insert fvarId }}
 
 @[inline]
@@ -264,7 +283,10 @@ def useLetValue (value : LetValue .impure) : RcM Unit := do
 def bindVar (fvarId : FVarId) : RcM Unit :=
   modify fun s => { s with liveVars := s.liveVars.erase fvarId }
 
-def setRetLiveVars : RcM Unit := sorry
+def setRetLiveVars : RcM Unit := do
+  let borrows ← (← read).borrowedParams.foldM (init := {}) fun borrows x =>
+    addDescendants x (borrows.insert x)
+  set { liveVars := { vars := {}, borrows } : State }
 
 @[inline]
 def addInc (fvarId : FVarId) (k : Code .impure) (n : Nat := 1) : RcM (Code .impure) := do
@@ -292,13 +314,68 @@ def addDecForAlt (altLiveVars : LiveVars) (k : Code .impure) : RcM (Code .impure
     else
       return k
 
-def addIncBeforeConsumeAll (allArgs : Array (Arg .impure)) (k : Code .impure) :
-    RcM (Code .impure) := do
-  sorry
+/-- `isFirstOcc xs x i = true` if `xs[i]` is the first occurrence of `xs[i]` in `xs` -/
+def isFirstOcc (xs : Array (Arg .impure)) (i : Nat) : Bool :=
+  let x := xs[i]!
+  i.all fun j _ => xs[j]! != x
+
+/--
+Return true if `x` also occurs in `ys` in a position that is not consumed.
+That is, it is also passed as a borrow reference.
+-/
+def isBorrowParamAux (x : FVarId) (ys : Array (Arg .impure)) (consumeParamPred : Nat → Bool) :
+    Bool :=
+  ys.size.any fun i _ =>
+    let y := ys[i]
+    match y with
+    | .erased => false
+    | .fvar y  => x == y && !consumeParamPred i
+
+def isBorrowParam (x : FVarId) (ys : Array (Arg .impure)) (ps : Array (Param .impure)) : Bool :=
+  isBorrowParamAux x ys fun i => ! ps[i]!.borrow
+
+/--
+Return `n`, the number of times `arg` is consumed.
+- `args` is a sequence of instruction parameters where we search for `arg`.
+- `consumeParamPred i = true` if parameter `i` is consumed.
+-/
+def getNumConsumptions (arg : FVarId) (args : Array (Arg .impure)) (consumeParamPred : Nat → Bool) :
+    Nat := Id.run do
+  let mut num := 0
+  for h : i in 0...args.size do
+    let arg' := args[i]
+    if let .fvar arg' := arg' then
+      if arg == arg' && consumeParamPred i then
+        num := num + 1
+  return num
+
+def addIncBeforeAux (args : Array (Arg .impure)) (consumeParamPred : Nat → Bool)
+    (k : Code .impure) : RcM (Code .impure) := do
+  let mut k := k
+  for h : i in 0...args.size do
+    let arg := args[i]
+    if let .fvar fvarId := arg then
+      let info ← getVarInfo fvarId
+      if !info.isPossibleRef || !isFirstOcc args i then
+        continue
+      let numConsumptions := getNumConsumptions fvarId args consumeParamPred
+      let numIncs ←
+        if (← isLive fvarId)
+            || (← isBorrowed fvarId)
+            || isBorrowParamAux fvarId args consumeParamPred then -- `fvarId` is used in a position that is passed as a borrow reference
+          pure (numConsumptions)
+        else
+          pure (numConsumptions - 1)
+      k ← addInc fvarId k numIncs
+  return k
 
 def addIncBefore (args : Array (Arg .impure)) (ps : Array (Param .impure)) (k : Code .impure) :
+    RcM (Code .impure) :=
+  addIncBeforeAux args (fun i => !ps[i]!.borrow) k
+
+def addIncBeforeConsumeAll (args : Array (Arg .impure)) (k : Code .impure) :
     RcM (Code .impure) := do
-  sorry
+  addIncBeforeAux args (fun _ => true) k
 
 def addDecAfterFullApp (args : Array (Arg .impure)) (ps : Array (Param .impure)) (k : Code .impure) :
     RcM (Code .impure) := do
@@ -314,7 +391,11 @@ def addDecAfterFullApp (args : Array (Arg .impure)) (ps : Array (Param .impure))
       This is why we check whether it is the first occurrence.
       -/
       let info ← getVarInfo fvarId
-      if info.isPossibleRef && isFirstOcc args i && isBorrowParam arg args ps && !(← isLive fvarId) && (← isBorrowed fvarId) then
+      if info.isPossibleRef
+          && isFirstOcc args i
+          && isBorrowParam fvarId args ps
+          && !(← isLive fvarId)
+          && (← isBorrowed fvarId) then
         k ← addDec fvarId k
   return k
 
